@@ -10,7 +10,7 @@ import argparse            # Para procesar argumentos de línea de comandos
 CONFIG_BD = {
     'dbname': 'Proyecto2',  # Nombre de la base de datos
     'user': 'postgres',            # Usuario de PostgreSQL
-    'password': '1999',          # Contraseña del usuario
+    'password': '123456789',          # Contraseña del usuario
     'host': 'localhost',           # Dirección del servidor
     'port': 5432                   # Puerto por defecto de PostgreSQL
 }
@@ -99,6 +99,13 @@ def reservar_asiento(id_usuario, id_evento, numero_asiento, nivel_aislamiento, r
             'tiempo': tiempo_total
         })
 
+# Diccionario que asocia nombres de niveles de aislamiento con sus valores
+niveles_aislamiento = {
+    'READ COMMITTED': psycopg2.extensions.ISOLATION_LEVEL_READ_COMMITTED,
+    'REPEATABLE READ': psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ, 
+    'SERIALIZABLE': psycopg2.extensions.ISOLATION_LEVEL_SERIALIZABLE
+}
+
 # Función para listar eventos disponibles
 def listar_eventos():
     try:
@@ -117,6 +124,199 @@ def listar_eventos():
     except Exception as error:
         print(f"Error al listar eventos: {error}")
         return []
+
+# Función para preparar asientos para un evento
+def preparar_asientos(id_evento, num_asientos):
+    try:
+        conexion = psycopg2.connect(**CONFIG_BD)
+        cursor = conexion.cursor()
+        
+        # Verificar si el evento existe
+        cursor.execute("SELECT nombre FROM eventos WHERE id_evento = %s;", (id_evento,))
+        evento = cursor.fetchone()
+        
+        if not evento:
+            print(f"❌ El evento con ID {id_evento} no existe.")
+            cursor.close()
+            conexion.close()
+            return False
+        
+        # Eliminar asientos anteriores para este evento
+        cursor.execute("DELETE FROM reservas WHERE id_evento = %s;", (id_evento,))
+        cursor.execute("DELETE FROM asientos WHERE id_evento = %s;", (id_evento,))
+        
+        # Crear nuevos asientos
+        print(f"🔄 Creando {num_asientos} asientos para el evento {id_evento}: {evento[0]}")
+        
+        # Usar generate_series para inserción masiva
+        cursor.execute(
+            "INSERT INTO asientos (id_evento, numero_asiento, estado) "
+            "SELECT %s, generate_series(1, %s), 'disponible';", 
+            (id_evento, num_asientos)
+        )
+        
+        conexion.commit()
+        print(f"✅ Se han creado {num_asientos} asientos disponibles para el evento.")
+        
+        cursor.close()
+        conexion.close()
+        return True
+        
+    except Exception as error:
+        print(f"Error al preparar asientos: {error}")
+        try:
+            conexion.rollback()
+            conexion.close()
+        except:
+            pass
+        return False
+
+# Función que ejecuta la simulación completa
+def ejecutar_simulacion(numero_usuarios, aislamiento, id_evento, porcentaje_conflicto=30):
+    print(f"\n=== Simulación con {numero_usuarios} usuarios / Aislamiento: {aislamiento} / Evento: {id_evento} ===")
+    
+    # Lista para almacenar resultados
+    resultados = []
+    hilos = []
+    
+    # Obtener todos los asientos disponibles para el evento
+    try:
+        conexion = psycopg2.connect(**CONFIG_BD)
+        cursor = conexion.cursor()
+        cursor.execute(
+            "SELECT numero_asiento FROM asientos WHERE id_evento = %s AND estado = 'disponible';", 
+            (id_evento,)
+        )
+        asientos_disponibles = [row[0] for row in cursor.fetchall()]
+        
+        # Obtener nombre del evento
+        cursor.execute("SELECT nombre FROM eventos WHERE id_evento = %s;", (id_evento,))
+        nombre_evento = cursor.fetchone()[0] if cursor.rowcount > 0 else f"Evento {id_evento}"
+        
+        cursor.close()
+        conexion.close()
+        
+        print(f"📊 Evento: {nombre_evento}")
+        print(f"📊 Asientos disponibles: {len(asientos_disponibles)}")
+        
+        if len(asientos_disponibles) < numero_usuarios:
+            print(f"⚠️ Advertencia: Solo hay {len(asientos_disponibles)} asientos disponibles para {numero_usuarios} usuarios.")
+        
+        # Asegurar que tenemos suficientes asientos para los usuarios
+        if not asientos_disponibles:
+            print("❌ No hay asientos disponibles para este evento.")
+            return {
+                'usuarios': numero_usuarios,
+                'nivel_aislamiento': aislamiento,
+                'reservas_exitosas': 0,
+                'reservas_fallidas': numero_usuarios,
+                'tiempo_promedio': 0
+            }
+            
+    except Exception as error:
+        print(f"Error al obtener asientos disponibles: {error}")
+        return None
+    
+    tiempo_inicio_global = time.time()
+    
+    # Crea un hilo por cada usuario simulado
+    for i in range(numero_usuarios):
+        id_usuario = random.randint(1, 10)  # ID aleatorio entre 1 y 10
+        
+        # Elegir un asiento aleatorio de los disponibles o repetir uno para causar conflicto
+        # Para simular la concurrencia, algunos usuarios intentarán reservar el mismo asiento
+        if i < len(asientos_disponibles) and random.random() > (porcentaje_conflicto / 100):
+            asiento = random.choice(asientos_disponibles)
+            asientos_disponibles.remove(asiento)  # Quitar asiento para no volver a seleccionarlo
+        else:
+            # Intentar un asiento que podría ya estar seleccionado (simular conflicto)
+            if asientos_disponibles:
+                asiento = random.choice(asientos_disponibles)
+            else:
+                # Si no quedan asientos disponibles, escoge uno aleatorio (que causará conflicto)
+                max_asiento = 50  # Valor por defecto
+                try:
+                    conexion = psycopg2.connect(**CONFIG_BD)
+                    cursor = conexion.cursor()
+                    cursor.execute("SELECT MAX(numero_asiento) FROM asientos WHERE id_evento = %s;", (id_evento,))
+                    max_result = cursor.fetchone()[0]
+                    if max_result:
+                        max_asiento = max_result
+                    cursor.close()
+                    conexion.close()
+                except:
+                    pass
+                asiento = random.randint(1, max_asiento)
+        
+        print(f"➡️ Usuario {id_usuario} intentará reservar el asiento {asiento}")
+        
+        # Crea el hilo para la reserva
+        hilo = threading.Thread(
+            target=reservar_asiento,
+            args=(id_usuario, id_evento, asiento, niveles_aislamiento[aislamiento], resultados)
+        )
+        
+        hilos.append(hilo)
+        hilo.start()
+        time.sleep(0.05)  # Pequeña pausa entre lanzamientos de hilos
+    
+    # Espera a que todos los hilos terminen
+    for hilo in hilos:
+        hilo.join()
+    
+    tiempo_total_global = time.time() - tiempo_inicio_global
+    
+    # Analizar resultados
+    exitosas = sum(1 for r in resultados if r['exito'])
+    fallidas = numero_usuarios - exitosas
+    tiempo_promedio = sum(r['tiempo'] for r in resultados) / len(resultados) if resultados else 0
+    
+    print("\n===== RESULTADOS =====")
+    print(f"Nivel de aislamiento: {aislamiento}")
+    print(f"Usuarios concurrentes: {numero_usuarios}")
+    print(f"Reservas exitosas: {exitosas}")
+    print(f"Reservas fallidas: {fallidas}")
+    print(f"Tiempo promedio por reserva: {tiempo_promedio:.2f} ms")
+    print(f"Tiempo total de la simulación: {tiempo_total_global:.2f} segundos")
+    print("=====================\n")
+    
+    return {
+        'usuarios': numero_usuarios,
+        'nivel_aislamiento': aislamiento,
+        'reservas_exitosas': exitosas,
+        'reservas_fallidas': fallidas,
+        'tiempo_promedio': tiempo_promedio
+    }
+
+# Función para realizar todas las pruebas requeridas
+def ejecutar_todas_pruebas(id_evento):
+    resultados = []
+    
+    # Pruebas requeridas según la especificación
+    configuraciones = [
+        {'usuarios': 5, 'aislamiento': 'READ COMMITTED'},
+        {'usuarios': 10, 'aislamiento': 'REPEATABLE READ'},
+        {'usuarios': 20, 'aislamiento': 'SERIALIZABLE'},
+        {'usuarios': 30, 'aislamiento': 'SERIALIZABLE'}
+    ]
+    
+    for config in configuraciones:
+        resultado = ejecutar_simulacion(
+            numero_usuarios=config['usuarios'],
+            aislamiento=config['aislamiento'],
+            id_evento=id_evento
+        )
+        if resultado:
+            resultados.append(resultado)
+            time.sleep(1)  # Pausa entre pruebas
+    
+    # Generar tabla de resultados en formato adecuado para el informe
+    print("\n===== TABLA DE RESULTADOS PARA EL INFORME =====")
+    print("| Usuarios | Nivel de Aislamiento | Reservas Exitosas | Reservas Fallidas | Tiempo Promedio |")
+    print("|----------|----------------------|-------------------|-------------------|-----------------|")
+    for r in resultados:
+        print(f"| {r['usuarios']:8} | {r['nivel_aislamiento']:20} | {r['reservas_exitosas']:17} | {r['reservas_fallidas']:17} | {r['tiempo_promedio']:.2f} ms {' ':8} |")
+    print("================================================\n")
 
 # Menú interactivo para configurar la simulación
 def menu_interactivo():
